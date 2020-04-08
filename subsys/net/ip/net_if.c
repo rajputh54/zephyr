@@ -100,9 +100,7 @@ static sys_slist_t mcast_monitor_callbacks;
 #define CONFIG_NET_PKT_TIMESTAMP_STACK_SIZE 1024
 #endif
 
-NET_STACK_DEFINE(TIMESTAMP, tx_ts_stack,
-		 CONFIG_NET_PKT_TIMESTAMP_STACK_SIZE,
-		 CONFIG_NET_PKT_TIMESTAMP_STACK_SIZE);
+K_THREAD_STACK_DEFINE(tx_ts_stack, CONFIG_NET_PKT_TIMESTAMP_STACK_SIZE);
 K_FIFO_DEFINE(tx_ts_queue);
 
 static struct k_thread tx_thread_ts;
@@ -115,8 +113,11 @@ static sys_slist_t timestamp_callbacks;
 #if CONFIG_NET_IF_LOG_LEVEL >= LOG_LEVEL_DBG
 #define debug_check_packet(pkt)						\
 	do {								\
-		NET_DBG("Processing (pkt %p, prio %d) network packet",	\
-			pkt, net_pkt_priority(pkt));			\
+		NET_DBG("Processing (pkt %p, prio %d) network packet "	\
+			"iface %p/%d",					\
+			pkt, net_pkt_priority(pkt),			\
+			net_pkt_iface(pkt),				\
+			net_if_get_by_iface(net_pkt_iface(pkt)));	\
 									\
 		NET_ASSERT(pkt->frags);					\
 	} while (0)
@@ -146,7 +147,10 @@ static inline void net_context_send_cb(struct net_context *context,
 
 static bool net_if_tx(struct net_if *iface, struct net_pkt *pkt)
 {
-	struct net_linkaddr *dst;
+	struct net_linkaddr ll_dst = {
+		.addr = NULL
+	};
+	struct net_linkaddr_storage ll_dst_storage;
 	struct net_context *context;
 	int status;
 
@@ -163,13 +167,25 @@ static bool net_if_tx(struct net_if *iface, struct net_pkt *pkt)
 
 	debug_check_packet(pkt);
 
-	dst = net_pkt_lladdr_dst(pkt);
+	/* If there're any link callbacks, with such a callback receiving
+	 * a destination address, copy that address out of packet, just in
+	 * case packet is freed before callback is called.
+	 */
+	if (!sys_slist_is_empty(&link_callbacks)) {
+		if (net_linkaddr_set(&ll_dst_storage,
+				     net_pkt_lladdr_dst(pkt)->addr,
+				     net_pkt_lladdr_dst(pkt)->len) == 0) {
+			ll_dst.addr = ll_dst_storage.addr;
+			ll_dst.len = ll_dst_storage.len;
+			ll_dst.type = net_pkt_lladdr_dst(pkt)->type;
+		}
+	}
+
 	context = net_pkt_context(pkt);
 
 	if (net_if_flag_is_set(iface, NET_IF_UP)) {
 		if (IS_ENABLED(CONFIG_NET_TCP) &&
 		    net_pkt_family(pkt) != AF_UNSPEC) {
-			net_pkt_set_sent(pkt, true);
 			net_pkt_set_queued(pkt, false);
 		}
 
@@ -235,8 +251,8 @@ static bool net_if_tx(struct net_if *iface, struct net_pkt *pkt)
 		}
 	}
 
-	if (dst->addr) {
-		net_if_call_link_cb(iface, dst, status);
+	if (ll_dst.addr) {
+		net_if_call_link_cb(iface, &ll_dst, status);
 	}
 
 	return true;
@@ -244,11 +260,18 @@ static bool net_if_tx(struct net_if *iface, struct net_pkt *pkt)
 
 static void process_tx_packet(struct k_work *work)
 {
+	struct net_if *iface;
 	struct net_pkt *pkt;
 
 	pkt = CONTAINER_OF(work, struct net_pkt, work);
 
-	net_if_tx(net_pkt_iface(pkt), pkt);
+	iface = net_pkt_iface(pkt);
+
+	net_if_tx(iface, pkt);
+
+#if defined(CONFIG_NET_POWER_MANAGEMENT)
+	iface->tx_pending--;
+#endif
 }
 
 void net_if_queue_tx(struct net_if *iface, struct net_pkt *pkt)
@@ -266,7 +289,16 @@ void net_if_queue_tx(struct net_if *iface, struct net_pkt *pkt)
 	NET_DBG("TC %d with prio %d pkt %p", tc, prio, pkt);
 #endif
 
-	net_tc_submit_to_tx_queue(tc, pkt);
+#if defined(CONFIG_NET_POWER_MANAGEMENT)
+	iface->tx_pending++;
+#endif
+
+	if (!net_tc_submit_to_tx_queue(tc, pkt)) {
+#if defined(CONFIG_NET_POWER_MANAGEMENT)
+		iface->tx_pending--
+#endif
+			;
+	}
 }
 
 void net_if_stats_reset(struct net_if *iface)
@@ -315,7 +347,8 @@ enum net_verdict net_if_send_data(struct net_if *iface, struct net_pkt *pkt)
 	enum net_verdict verdict = NET_OK;
 	int status = -EIO;
 
-	if (!net_if_flag_is_set(iface, NET_IF_UP)) {
+	if (!net_if_flag_is_set(iface, NET_IF_UP) ||
+	    net_if_flag_is_set(iface, NET_IF_SUSPENDED)) {
 		/* Drop packet if interface is not up */
 		NET_WARN("iface %p is down", iface);
 		verdict = NET_DROP;
@@ -3590,6 +3623,43 @@ bool net_if_is_promisc(struct net_if *iface)
 
 	return net_if_flag_is_set(iface, NET_IF_PROMISC);
 }
+
+#ifdef CONFIG_NET_POWER_MANAGEMENT
+
+int net_if_suspend(struct net_if *iface)
+{
+	if (net_if_are_pending_tx_packets(iface)) {
+		return -EBUSY;
+	}
+
+	if (net_if_flag_test_and_set(iface, NET_IF_SUSPENDED)) {
+		return -EALREADY;
+	}
+
+	net_stats_add_suspend_start_time(iface, k_cycle_get_32());
+
+	return 0;
+}
+
+int net_if_resume(struct net_if *iface)
+{
+	if (!net_if_flag_is_set(iface, NET_IF_SUSPENDED)) {
+		return -EALREADY;
+	}
+
+	net_if_flag_clear(iface, NET_IF_SUSPENDED);
+
+	net_stats_add_suspend_end_time(iface, k_cycle_get_32());
+
+	return 0;
+}
+
+bool net_if_is_suspended(struct net_if *iface)
+{
+	return net_if_flag_is_set(iface, NET_IF_SUSPENDED);
+}
+
+#endif /* CONFIG_NET_POWER_MANAGEMENT */
 
 #if defined(CONFIG_NET_PKT_TIMESTAMP_THREAD)
 static void net_tx_ts_thread(void)

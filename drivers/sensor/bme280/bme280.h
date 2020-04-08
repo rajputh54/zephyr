@@ -19,13 +19,21 @@
 #define BME280_REG_CONFIG               0xF5
 #define BME280_REG_CTRL_MEAS            0xF4
 #define BME280_REG_CTRL_HUM             0xF2
+#define BME280_REG_STATUS               0xF3
 
 #define BMP280_CHIP_ID_SAMPLE_1         0x56
 #define BMP280_CHIP_ID_SAMPLE_2         0x57
 #define BMP280_CHIP_ID_MP               0x58
 #define BME280_CHIP_ID                  0x60
+#define BME280_MODE_FORCED              0x01
 #define BME280_MODE_NORMAL              0x03
 #define BME280_SPI_3W_DISABLE           0x00
+
+#if defined CONFIG_BME280_MODE_NORMAL
+#define BME280_MODE BME280_MODE_NORMAL
+#elif defined CONFIG_BME280_MODE_FORCED
+#define BME280_MODE BME280_MODE_FORCED
+#endif
 
 #if defined CONFIG_BME280_TEMP_OVER_1X
 #define BME280_TEMP_OVER                (1 << 5)
@@ -95,19 +103,19 @@
 
 #define BME280_CTRL_MEAS_VAL            (BME280_PRESS_OVER | \
 					 BME280_TEMP_OVER |  \
-					 BME280_MODE_NORMAL)
+					 BME280_MODE)
 #define BME280_CONFIG_VAL               (BME280_STANDBY | \
 					 BME280_FILTER |  \
 					 BME280_SPI_3W_DISABLE)
 
 struct bme280_data {
-#ifdef DT_BOSCH_BME280_BUS_I2C
+#if DT_ANY_INST_ON_BUS(i2c)
 	struct device *i2c_master;
 	u16_t i2c_slave_addr;
-#elif defined DT_BOSCH_BME280_BUS_SPI
+#elif DT_ANY_INST_ON_BUS(spi)
 	struct device *spi;
 	struct spi_config spi_cfg;
-#if defined(DT_INST_0_BOSCH_BME280_CS_GPIOS_CONTROLLER)
+#if DT_INST_SPI_DEV_HAS_CS_GPIOS(0)
 	struct spi_cs_control spi_cs_control;
 #endif
 #else

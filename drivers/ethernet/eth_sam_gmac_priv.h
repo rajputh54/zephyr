@@ -27,34 +27,64 @@
 #define GMAC_FRAME_SIZE_MAX (GMAC_MTU + 18)
 
 /** Cache alignment */
-#define GMAC_DCACHE_ALIGNMENT             32
+#define GMAC_DCACHE_ALIGNMENT           32
 /** Memory alignment of the RX/TX Buffer Descriptor List */
-#define GMAC_DESC_ALIGNMENT               4
+#define GMAC_DESC_ALIGNMENT             4
 /** Total number of queues supported by GMAC hardware module */
-#define GMAC_QUEUE_NO                     3
+#define GMAC_QUEUE_NUM                  DT_INST_PROP(0, num_queues)
+#define GMAC_PRIORITY_QUEUE_NUM         (GMAC_QUEUE_NUM - 1)
+#if (GMAC_PRIORITY_QUEUE_NUM >= 1)
+BUILD_ASSERT(ARRAY_SIZE(GMAC->GMAC_TBQBAPQ) + 1 == GMAC_QUEUE_NUM,
+	     "GMAC_QUEUE_NUM doesn't match soc header");
+#endif
 /** Number of priority queues used */
-#define GMAC_PRIORITY_QUEUE_NO            (CONFIG_ETH_SAM_GMAC_QUEUES - 1)
+#define GMAC_ACTIVE_QUEUE_NUM           (CONFIG_ETH_SAM_GMAC_QUEUES)
+#define GMAC_ACTIVE_PRIORITY_QUEUE_NUM  (GMAC_ACTIVE_QUEUE_NUM - 1)
 
 /** RX descriptors count for main queue */
-#define MAIN_QUEUE_RX_DESC_COUNT CONFIG_ETH_SAM_GMAC_BUF_RX_COUNT
+#define MAIN_QUEUE_RX_DESC_COUNT        CONFIG_ETH_SAM_GMAC_BUF_RX_COUNT
 /** TX descriptors count for main queue */
-#define MAIN_QUEUE_TX_DESC_COUNT (CONFIG_NET_BUF_TX_COUNT + 1)
+#define MAIN_QUEUE_TX_DESC_COUNT        (CONFIG_NET_BUF_TX_COUNT + 1)
 
 /** RX/TX descriptors count for priority queues */
-#if GMAC_PRIORITY_QUEUE_NO == 2
-#define PRIORITY_QUEUE2_RX_DESC_COUNT         MAIN_QUEUE_RX_DESC_COUNT
-#define PRIORITY_QUEUE2_TX_DESC_COUNT         MAIN_QUEUE_TX_DESC_COUNT
+#if GMAC_ACTIVE_PRIORITY_QUEUE_NUM >= 1
+#define PRIORITY_QUEUE1_RX_DESC_COUNT   MAIN_QUEUE_RX_DESC_COUNT
+#define PRIORITY_QUEUE1_TX_DESC_COUNT   MAIN_QUEUE_TX_DESC_COUNT
 #else
-#define PRIORITY_QUEUE2_RX_DESC_COUNT         1
-#define PRIORITY_QUEUE2_TX_DESC_COUNT         1
+#define PRIORITY_QUEUE1_RX_DESC_COUNT   1
+#define PRIORITY_QUEUE1_TX_DESC_COUNT   1
 #endif
 
-#if GMAC_PRIORITY_QUEUE_NO >= 1
-#define PRIORITY_QUEUE1_RX_DESC_COUNT         MAIN_QUEUE_RX_DESC_COUNT
-#define PRIORITY_QUEUE1_TX_DESC_COUNT         MAIN_QUEUE_TX_DESC_COUNT
+#if GMAC_ACTIVE_PRIORITY_QUEUE_NUM >= 2
+#define PRIORITY_QUEUE2_RX_DESC_COUNT   MAIN_QUEUE_RX_DESC_COUNT
+#define PRIORITY_QUEUE2_TX_DESC_COUNT   MAIN_QUEUE_TX_DESC_COUNT
 #else
-#define PRIORITY_QUEUE1_RX_DESC_COUNT         1
-#define PRIORITY_QUEUE1_TX_DESC_COUNT         1
+#define PRIORITY_QUEUE2_RX_DESC_COUNT   1
+#define PRIORITY_QUEUE2_TX_DESC_COUNT   1
+#endif
+
+#if GMAC_ACTIVE_PRIORITY_QUEUE_NUM >= 3
+#define PRIORITY_QUEUE3_RX_DESC_COUNT   MAIN_QUEUE_RX_DESC_COUNT
+#define PRIORITY_QUEUE3_TX_DESC_COUNT   MAIN_QUEUE_TX_DESC_COUNT
+#else
+#define PRIORITY_QUEUE3_RX_DESC_COUNT   1
+#define PRIORITY_QUEUE3_TX_DESC_COUNT   1
+#endif
+
+#if GMAC_ACTIVE_PRIORITY_QUEUE_NUM >= 4
+#define PRIORITY_QUEUE4_RX_DESC_COUNT   MAIN_QUEUE_RX_DESC_COUNT
+#define PRIORITY_QUEUE4_TX_DESC_COUNT   MAIN_QUEUE_TX_DESC_COUNT
+#else
+#define PRIORITY_QUEUE4_RX_DESC_COUNT   1
+#define PRIORITY_QUEUE4_TX_DESC_COUNT   1
+#endif
+
+#if GMAC_ACTIVE_PRIORITY_QUEUE_NUM >= 5
+#define PRIORITY_QUEUE5_RX_DESC_COUNT   MAIN_QUEUE_RX_DESC_COUNT
+#define PRIORITY_QUEUE5_TX_DESC_COUNT   MAIN_QUEUE_TX_DESC_COUNT
+#else
+#define PRIORITY_QUEUE5_RX_DESC_COUNT   1
+#define PRIORITY_QUEUE5_TX_DESC_COUNT   1
 #endif
 
 /*
@@ -147,6 +177,9 @@ enum queue_idx {
 	GMAC_QUE_0,  /** Main queue */
 	GMAC_QUE_1,  /** Priority queue 1 */
 	GMAC_QUE_2,  /** Priority queue 2 */
+	GMAC_QUE_3,  /** Priority queue 3 */
+	GMAC_QUE_4,  /** Priority queue 4 */
+	GMAC_QUE_5,  /** Priority queue 5 */
 };
 
 /** Minimal ring buffer implementation */
@@ -217,7 +250,9 @@ struct eth_sam_dev_data {
 	struct device *ptp_clock;
 #endif
 	u8_t mac_addr[6];
-	struct gmac_queue queue_list[GMAC_QUEUE_NO];
+	struct k_delayed_work monitor_work;
+	bool link_up;
+	struct gmac_queue queue_list[GMAC_QUEUE_NUM];
 };
 
 #define DEV_CFG(dev) \

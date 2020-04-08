@@ -83,7 +83,8 @@ static void timer_isr(void *arg)
 int z_clock_driver_init(struct device *device)
 {
 	IRQ_CONNECT(RISCV_MACHINE_TIMER_IRQ, 0, timer_isr, NULL, 0);
-	set_mtimecmp(mtime() + CYC_PER_TICK);
+	last_count = mtime();
+	set_mtimecmp(last_count + CYC_PER_TICK);
 	irq_enable(RISCV_MACHINE_TIMER_IRQ);
 	return 0;
 }
@@ -103,7 +104,7 @@ void z_clock_set_timeout(s32_t ticks, bool idle)
 		return;
 	}
 
-	ticks = ticks == K_FOREVER ? MAX_TICKS : ticks;
+	ticks = ticks == K_TICKS_FOREVER ? MAX_TICKS : ticks;
 	ticks = MAX(MIN(ticks - 1, (s32_t)MAX_TICKS), 0);
 
 	k_spinlock_key_t key = k_spin_lock(&lock);

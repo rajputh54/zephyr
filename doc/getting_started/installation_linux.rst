@@ -237,19 +237,19 @@ Follow these steps to install the Zephyr SDK:
 
    .. code-block:: console
 
-      wget https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v0.11.1/zephyr-sdk-0.11.1-setup.run
+      wget https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v0.11.2/zephyr-sdk-0.11.2-setup.run
 
-   (You can change *0.11.1* to another version if needed; the `Zephyr
+   (You can change *0.11.2* to another version if needed; the `Zephyr
    Downloads`_ page contains all available SDK releases.)
 
 #. Run the installation binary, installing the SDK at
-   :file:`~/zephyr-sdk-0.11.1`:
+   :file:`~/zephyr-sdk-0.11.2`:
 
    .. code-block:: console
 
       cd <sdk download directory>
-      chmod +x zephyr-sdk-0.11.1-setup.run
-      ./zephyr-sdk-0.11.1-setup.run -- -d ~/zephyr-sdk-0.11.1
+      chmod +x zephyr-sdk-0.11.2-setup.run
+      ./zephyr-sdk-0.11.2-setup.run -- -d ~/zephyr-sdk-0.11.2
 
    You can pick another directory if you want. If this fails, make sure
    Zephyr's dependencies were installed as described in `Install Requirements
@@ -258,7 +258,7 @@ Follow these steps to install the Zephyr SDK:
 #. Set these :ref:`environment variables <env_vars>`:
 
    - set :envvar:`ZEPHYR_TOOLCHAIN_VARIANT` to ``zephyr``
-   - set :envvar:`ZEPHYR_SDK_INSTALL_DIR` to :file:`$HOME/zephyr-sdk-0.11.1`
+   - set :envvar:`ZEPHYR_SDK_INSTALL_DIR` to :file:`$HOME/zephyr-sdk-0.11.2`
      (or wherever you chose to install the SDK)
 
 If you ever want to uninstall the SDK, just remove the directory where you
@@ -280,8 +280,7 @@ As already noted above, the SDK also includes prebuilt host tools.  To use the
 SDK's prebuilt host tools with a toolchain from another source, keep the
 :envvar:`ZEPHYR_SDK_INSTALL_DIR` environment variable set to the Zephyr SDK
 installation directory. To build without the Zephyr SDK's prebuilt host tools,
-the :envvar:`ZEPHYR_SDK_INSTALL_DIR` environment variable must be unset before
-you run ``source zephyr-env.sh`` later on in the Getting Started Guide.
+the :envvar:`ZEPHYR_SDK_INSTALL_DIR` environment variable must be unset.
 
 To make sure this variable is unset, run:
 

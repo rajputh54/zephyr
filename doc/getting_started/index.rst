@@ -42,7 +42,7 @@ tools. First, make sure your development system OS is updated:
 
    .. group-tab:: macOS
 
-      On macOS Mojave, you can manually check for updates by choosing
+      On macOS Mojave or later, you can manually check for updates by choosing
       System Preferences from the Apple menu, then clicking Software Update (and
       click Update Now if there are). For other macOS versions, see the
       `Update macOS topic in Apple support
@@ -246,6 +246,36 @@ directory using west:
          cd zephyrproject
          west update
 
+.. rst-class:: numbered-step
+
+Export Zephyr CMake package
+***************************
+
+Exporting Zephyr as a :ref:`cmake_pkg` makes it possible for CMake to automatically find and load
+boilerplate code for building a Zephyr application.
+
+Zephyr CMake package is exported with the following command
+
+.. tabs::
+
+   .. group-tab:: Ubuntu
+
+      .. code-block:: bash
+
+         west zephyr-export
+
+   .. group-tab:: macOS
+
+      .. code-block:: bash
+
+         west zephyr-export
+
+   .. group-tab:: Windows
+
+      .. code-block:: bat
+
+         west zephyr-export
+
 .. _install_py_requirements:
 
 .. rst-class:: numbered-step
@@ -306,15 +336,15 @@ including: compiler, assembler, linker, and their dependencies.
          .. code-block:: bash
 
             cd ~
-            wget https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v0.11.1/zephyr-sdk-0.11.1-setup.run
+            wget https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v0.11.2/zephyr-sdk-0.11.2-setup.run
 
       #. Run the installation binary, installing the SDK in your home
-         folder :file:`~/zephyr-sdk-0.11.1`:
+         folder :file:`~/zephyr-sdk-0.11.2`:
 
          .. code-block:: bash
 
-            chmod +x zephyr-sdk-0.11.1-setup.run
-            ./zephyr-sdk-0.11.1-setup.run -- -d ~/zephyr-sdk-0.11.1
+            chmod +x zephyr-sdk-0.11.2-setup.run
+            ./zephyr-sdk-0.11.2-setup.run -- -d ~/zephyr-sdk-0.11.2
 
       #. Set environment variables to let the build system know where to
          find the toolchain programs:
@@ -322,7 +352,7 @@ including: compiler, assembler, linker, and their dependencies.
          .. code-block:: bash
 
             export ZEPHYR_TOOLCHAIN_VARIANT=zephyr
-            export ZEPHYR_SDK_INSTALL_DIR=~/zephyr-sdk-0.11.1
+            export ZEPHYR_SDK_INSTALL_DIR=~/zephyr-sdk-0.11.2
 
       The SDK contains a udev rules file that provides information
       needed to identify boards and grant hardware access permission to flash
@@ -361,30 +391,11 @@ The sample :ref:`blinky-sample` blinks an LED on the target board.  By
 building and running it, we can verify that the environment and tools
 are properly set up for Zephyr development.
 
-#. Set build environment variables:
-
-   .. tabs::
-
-      .. group-tab:: Ubuntu
-
-         .. code-block:: bash
-
-            cd ~/zephyrproject/zephyr
-            source zephyr-env.sh
-
-      .. group-tab:: macOS
-
-         .. code-block:: bash
-
-            cd ~/zephyrproject/zephyr
-            source zephyr-env.sh
-
-      .. group-tab:: Windows
-
-         .. code-block:: bat
-
-            cd %HOMEPATH%/zephyrproject/zephyr
-            zephyr-env.cmd
+   .. note:: This sample is compatible with most boards supported by
+      Zephyr, but not all of them. See the :ref:`blinky sample requirements
+      <blinky-sample-requirements>` for more information. If this sample is not
+      compatible with your board, a good alternative to try is the
+      :ref:`Hello World sample <hello_world>`.
 
 #. Build the blinky sample. Specify **your board name**
    (see :ref:`boards`) in the command below:

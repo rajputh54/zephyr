@@ -60,8 +60,8 @@ LOG_MODULE_REGISTER(usb_dfu);
 
 #define USB_DFU_MAX_XFER_SIZE		CONFIG_USB_REQUEST_BUFFER_SIZE
 
-#define FIRMWARE_IMAGE_0_LABEL "image-1"
-#define FIRMWARE_IMAGE_1_LABEL "image-0"
+#define FIRMWARE_IMAGE_0_LABEL "image-0"
+#define FIRMWARE_IMAGE_1_LABEL "image-1"
 
 /* MCUBoot waits for CONFIG_USB_DFU_WAIT_DELAY_MS time in total to let DFU to
  * be commenced. It intermittently checks every INTERMITTENT_CHECK_DELAY
@@ -509,6 +509,15 @@ static int dfu_class_handle_req(struct usb_setup_packet *pSetup,
 				len = pSetup->wLength;
 			}
 
+			if (len > USB_DFU_MAX_XFER_SIZE) {
+				/*
+				 * The host could requests more data as stated
+				 * in wTransferSize. Limit upload length to the
+				 * size of the request-buffer.
+				 */
+				len = USB_DFU_MAX_XFER_SIZE;
+			}
+
 			if (len) {
 				const struct flash_area *fa;
 
@@ -812,7 +821,7 @@ void wait_for_usb_dfu(void)
 			break;
 		}
 
-		k_sleep(INTERMITTENT_CHECK_DELAY);
+		k_msleep(INTERMITTENT_CHECK_DELAY);
 	}
 }
 

@@ -19,7 +19,7 @@
 #define WDT_DEV_NAME DT_ALIAS_WATCHDOG0_LABEL
 #else
 #ifdef CONFIG_WWDG_STM32
-#define WDT_DEV_NAME DT_WWDT_0_NAME
+#define WDT_DEV_NAME DT_LABEL(DT_INST(0, st_stm32_window_watchdog))
 #else
 #define WDT_DEV_NAME DT_WDT_0_NAME
 #endif

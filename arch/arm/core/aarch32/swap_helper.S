@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2013-2014 Wind River Systems, Inc.
  * Copyright (c) 2017-2019 Nordic Semiconductor ASA.
+ * Copyright (c) 2020 Stephanos Ioannidis <root@stephanos.io>
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -110,8 +111,9 @@ out_fp_endif:
 #endif /* CONFIG_FP_SHARING */
 #elif defined(CONFIG_ARMV7_R)
     /* Store rest of process context */
-    mrs r12, SPSR
-    stm r0, {r4-r12,sp,lr}^
+    cps #MODE_SYS
+    stm r0, {r4-r11, sp}
+    cps #MODE_SVC
 #else
 #error Unknown ARM architecture
 #endif /* CONFIG_ARMV6_M_ARMV8_M_BASELINE */
@@ -315,18 +317,13 @@ _thread_irq_disabled:
     ldr r0, =_thread_offset_to_callee_saved
     add r0, r2
 
-    /* restore r4-r12 for incoming thread, plus system sp and lr */
-    ldm r0, {r4-r12,sp,lr}^
-    msr SPSR_fsxc, r12
+    /* restore r4-r11 and sp for incoming thread */
+    cps #MODE_SYS
+    ldm r0, {r4-r11, sp}
+    cps #MODE_SVC
 #else
 #error Unknown ARM architecture
 #endif /* CONFIG_ARMV6_M_ARMV8_M_BASELINE */
-
-#ifdef CONFIG_BUILTIN_STACK_GUARD
-    /* clear stack pointer limit before setting the PSP */
-    mov r0, #0
-    msr PSPLIM, r0
-#endif /* CONFIG_BUILTIN_STACK_GUARD */
 
 #if defined(CONFIG_CPU_CORTEX_M)
     msr PSP, ip
@@ -514,7 +511,10 @@ _do_syscall:
     ldr ip, =K_SYSCALL_LIMIT
     cmp r6, ip
 #endif
-    blt valid_syscall_id
+    /* The supplied syscall_id must be lower than the limit
+     * (Requires unsigned integer comparison)
+     */
+    blo valid_syscall_id
 
     /* bad syscall id.  Set arg1 to bad id and set call_id to SYSCALL_BAD */
     str r6, [r0]
@@ -555,6 +555,16 @@ valid_syscall_id:
      */
     isb
 
+#if defined(CONFIG_BUILTIN_STACK_GUARD)
+    /* Thread is now in privileged mode; after returning from SCVall it
+     * will use the default (user) stack before switching to the privileged
+     * stack to execute the system call. We need to protect the user stack
+     * against stack overflows until this stack transition.
+     */
+    ldr r1, [r0, #_thread_offset_to_stack_info_start]    /* stack_info.start */
+    msr PSPLIM, r1
+#endif /* CONFIG_BUILTIN_STACK_GUARD */
+
     /* return from SVC to the modified LR - z_arm_do_syscall */
     bx lr
 #endif /* CONFIG_USERSPACE */
@@ -578,15 +588,21 @@ SECTION_FUNC(TEXT, z_arm_svc)
      * Save r12 and the lr as we could be swapping in another process and
      * returning to a different location.
      */
-    push {r4, r5}
-    mov r4, r12
-    mov r5, lr
-
+    srsdb #MODE_SYS!
     cps #MODE_SYS
-    stmdb sp!, {r0-r5}
+    push {r0-r3, r12, lr}
     cps #MODE_SVC
 
-    pop {r4, r5}
+    /* Align stack at double-word boundary */
+    and r3, sp, #4
+    sub sp, sp, r3
+    push {r2, r3}
+
+    /* Increment interrupt nesting count */
+    ldr r2, =_kernel
+    ldr r0, [r2, #_kernel_offset_to_nested]
+    add r0, r0, #1
+    str r0, [r2, #_kernel_offset_to_nested]
 
     /* Get SVC number */
     mrs r0, spsr
@@ -618,7 +634,6 @@ demux:
     blx z_irq_do_offload  /* call C routine which executes the offload */
 
     /* exception return is done in z_arm_int_exit() */
-    mov r0, #RET_FROM_SVC
     b z_arm_int_exit
 #endif
 
@@ -626,7 +641,6 @@ _context_switch:
     /* handler mode exit, to PendSV */
     bl z_arm_pendsv
 
-    mov r0, #RET_FROM_SVC
     b z_arm_int_exit
 
 _oops:

@@ -1,7 +1,9 @@
 /* ieee802154_rf2xx.c - ATMEL RF2XX IEEE 802.15.4 Driver */
 
+#define DT_DRV_COMPAT atmel_rf2xx
+
 /*
- * Copyright (c) 2019 Gerson Fernando Budke
+ * Copyright (c) 2019-2020 Gerson Fernando Budke
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -18,6 +20,7 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 
 #include <kernel.h>
 #include <arch/cpu.h>
+#include <debug/stack.h>
 
 #include <device.h>
 #include <init.h>
@@ -42,11 +45,12 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 #if defined(CONFIG_NET_L2_OPENTHREAD)
 #include <net/openthread.h>
 
-#define RF2XX_OT_PSDU_LENGTH            1280
+#define RF2XX_OT_PSDU_LENGTH              1280
 
-#define RF2XX_ACK_FRAME_LEN             3
-#define RF2XX_ACK_FRAME_TYPE           (2 << 0)
-#define RF2XX_ACK_FRAME_PENDING_BIT    (1 << 4)
+#define RF2XX_ACK_FRAME_LEN               3
+#define RF2XX_ACK_FRAME_TYPE              (2 << 0)
+#define RF2XX_ACK_FRAME_PENDING_BIT       (1 << 4)
+#define RF2XX_FRAME_CTRL_ACK_REQUEST_BIT  (1 << 5)
 
 static u8_t rf2xx_ack_psdu[RF2XX_ACK_FRAME_LEN] = { 0 };
 static struct net_buf rf2xx_ack_frame = {
@@ -54,6 +58,7 @@ static struct net_buf rf2xx_ack_frame = {
 	.size  = RF2XX_ACK_FRAME_LEN,
 	.len   = RF2XX_ACK_FRAME_LEN,
 	.__buf = rf2xx_ack_psdu,
+	.frags = NULL,
 };
 static struct net_pkt rf2xx_ack_pkt = {
 	.buffer = &rf2xx_ack_frame,
@@ -77,16 +82,6 @@ static inline void trx_isr_handler(struct device *port,
 	k_sem_give(&ctx->trx_isr_lock);
 }
 
-static void trx_isr_timeout(struct k_timer *timer_id)
-{
-	struct rf2xx_context *ctx = (struct rf2xx_context *)
-				    k_timer_user_data_get(timer_id);
-
-	k_mutex_lock(&ctx->phy_mutex, K_FOREVER);
-	ctx->trx_state = RF2XX_TRX_PHY_STATE_IDLE;
-	k_mutex_unlock(&ctx->phy_mutex);
-}
-
 static void rf2xx_trx_set_state(struct device *dev,
 				enum rf2xx_trx_state_cmd_t state)
 {
@@ -102,6 +97,30 @@ static void rf2xx_trx_set_state(struct device *dev,
 	} while (state !=
 		 (rf2xx_iface_reg_read(dev, RF2XX_TRX_STATUS_REG) &
 		  RF2XX_TRX_PHY_STATUS_MASK));
+}
+
+static void rf2xx_trx_set_tx_state(struct device *dev)
+{
+	u8_t status;
+
+	/**
+	 * Ensures that RX automatically ACK will be sent when requested.
+	 * Datasheet: Chapter 7.2.3 RX_AACK_ON – Receive with Automatic ACK
+	 * Datasheet: Figure 7-13. Timing Example of an RX_AACK Transaction
+	 * for Slotted Operation.
+	 *
+	 * This will create a spin lock that wait transceiver be free from
+	 * current receive frame process
+	 */
+	do {
+		status = (rf2xx_iface_reg_read(dev, RF2XX_TRX_STATUS_REG) &
+			  RF2XX_TRX_PHY_STATUS_MASK);
+	} while (status == RF2XX_TRX_PHY_STATUS_BUSY_RX_AACK ||
+		 status == RF2XX_TRX_PHY_STATUS_STATE_TRANSITION);
+
+	rf2xx_trx_set_state(dev, RF2XX_TRX_PHY_STATE_CMD_TRX_OFF);
+	rf2xx_iface_reg_read(dev, RF2XX_IRQ_STATUS_REG);
+	rf2xx_trx_set_state(dev, RF2XX_TRX_PHY_STATE_CMD_TX_ARET_ON);
 }
 
 static void rf2xx_trx_set_rx_state(struct device *dev)
@@ -131,8 +150,12 @@ static void rf2xx_trx_rx(struct device *dev)
 	 * This obligate the driver to have rx_buf statically allocated with
 	 * RX2XX_MAX_FRAME_SIZE.
 	 */
-	rf2xx_iface_frame_read(dev, rx_buf, RX2XX_FRAME_HEADER_SIZE);
-	pkt_len = rx_buf[RX2XX_FRAME_PHR_INDEX];
+	if (ctx->trx_model != RF2XX_TRX_MODEL_231) {
+		pkt_len = ctx->rx_phr;
+	} else {
+		rf2xx_iface_frame_read(dev, rx_buf, RX2XX_FRAME_HEADER_SIZE);
+		pkt_len = rx_buf[RX2XX_FRAME_PHR_INDEX];
+	}
 
 	if (pkt_len < RX2XX_FRAME_MIN_PHR_SIZE) {
 		LOG_ERR("invalid RX frame length");
@@ -185,11 +208,56 @@ static void rf2xx_trx_rx(struct device *dev)
 	}
 
 	if (LOG_LEVEL >= LOG_LEVEL_DBG) {
-		net_analyze_stack("RF2XX Rx stack",
-				Z_THREAD_STACK_BUFFER(ctx->trx_stack),
-				K_THREAD_STACK_SIZEOF(ctx->trx_stack));
+		log_stack_usage(&ctx->trx_thread);
 	}
 }
+
+static void rf2xx_process_rx_frame(struct device *dev)
+{
+	struct rf2xx_context *ctx = dev->driver_data;
+
+	if (ctx->trx_model != RF2XX_TRX_MODEL_231) {
+		rf2xx_trx_rx(dev);
+	} else {
+		/* Ensures that automatically ACK will be sent
+		 * when requested
+		 */
+		while (rf2xx_iface_reg_read(dev, RF2XX_TRX_STATUS_REG) ==
+		       RF2XX_TRX_PHY_STATUS_BUSY_RX_AACK) {
+			;
+		};
+
+		/* Set PLL_ON to avoid transceiver receive
+		 * new data until finish reading process
+		 */
+		rf2xx_trx_set_state(dev, RF2XX_TRX_PHY_STATE_CMD_PLL_ON);
+		rf2xx_trx_rx(dev);
+		rf2xx_trx_set_state(dev, RF2XX_TRX_PHY_STATE_CMD_RX_AACK_ON);
+	}
+}
+
+static void rf2xx_process_tx_frame(struct device *dev)
+{
+	struct rf2xx_context *ctx = dev->driver_data;
+
+	ctx->trx_trac = (rf2xx_iface_reg_read(dev, RF2XX_TRX_STATE_REG) >>
+			 RF2XX_TRAC_STATUS) & 7;
+	k_sem_give(&ctx->trx_tx_sync);
+	rf2xx_trx_set_rx_state(dev);
+}
+
+static void rf2xx_process_trx_end(struct device *dev)
+{
+	u8_t trx_status = (rf2xx_iface_reg_read(dev, RF2XX_TRX_STATUS_REG) &
+			   RF2XX_TRX_PHY_STATUS_MASK);
+
+	if (trx_status == RF2XX_TRX_PHY_STATUS_TX_ARET_ON) {
+		rf2xx_process_tx_frame(dev);
+	} else {
+		rf2xx_process_rx_frame(dev);
+	}
+}
+
 static void rf2xx_thread_main(void *arg)
 {
 	struct device *dev = INT_TO_POINTER(arg);
@@ -198,9 +266,9 @@ static void rf2xx_thread_main(void *arg)
 
 	while (true) {
 		k_sem_take(&ctx->trx_isr_lock, K_FOREVER);
-		k_mutex_lock(&ctx->phy_mutex, K_FOREVER);
 
 		isr_status = rf2xx_iface_reg_read(dev, RF2XX_IRQ_STATUS_REG);
+
 		/*
 		 *  IRQ_7 (BAT_LOW) Indicates a supply voltage below the
 		 *    programmed threshold. 9.5.4
@@ -228,39 +296,12 @@ static void rf2xx_thread_main(void *arg)
 		 *  IRQ_0 (PLL_LOCK) Indicates PLL lock.
 		 */
 		if (isr_status & (1 << RF2XX_RX_START)) {
-			ctx->trx_state = RF2XX_TRX_PHY_BUSY_RX;
-			k_timer_start(&ctx->trx_isr_timeout, K_MSEC(10), 0);
-		} else if (isr_status & (1 << RF2XX_TRX_END)) {
-			if (ctx->trx_state == RF2XX_TRX_PHY_BUSY_RX) {
-				/* Ensures that automatically ACK will be sent
-				 * when requested
-				 */
-				while (rf2xx_iface_reg_read(dev,
-							    RF2XX_TRX_STATUS_REG) ==
-				       RF2XX_TRX_PHY_STATUS_BUSY_RX_AACK) {
-				};
-
-				/* Set PLL_ON to avoid transceiver receive
-				 * new data until finish reading process
-				 */
-				rf2xx_trx_set_state(dev,
-						    RF2XX_TRX_PHY_STATE_CMD_PLL_ON);
-				k_timer_stop(&ctx->trx_isr_timeout);
-				rf2xx_trx_rx(dev);
-				rf2xx_trx_set_state(dev,
-						    RF2XX_TRX_PHY_STATE_CMD_RX_AACK_ON);
-				/*if (ctx->trx_state == RF2XX_TRX_PHY_BUSY_TX)*/
-			} else {
-				ctx->trx_trac =
-					(rf2xx_iface_reg_read(dev,
-							      RF2XX_TRX_STATE_REG) >>
-					 RF2XX_TRAC_STATUS) & 7;
-				k_sem_give(&ctx->trx_tx_sync);
-				rf2xx_trx_set_rx_state(dev);
+			if (ctx->trx_model != RF2XX_TRX_MODEL_231) {
+				rf2xx_iface_sram_read(dev, 0, &ctx->rx_phr, 1);
 			}
-			ctx->trx_state = RF2XX_TRX_PHY_STATE_IDLE;
+		} else if (isr_status & (1 << RF2XX_TRX_END)) {
+			rf2xx_process_trx_end(dev);
 		}
-		k_mutex_unlock(&ctx->phy_mutex);
 	}
 }
 
@@ -408,18 +449,22 @@ static int rf2xx_filter(struct device *dev,
 }
 
 #if defined(CONFIG_NET_L2_OPENTHREAD)
-static void rf2xx_handle_ack(struct rf2xx_context *ctx, u8_t seq_number)
+static void rf2xx_handle_ack(struct rf2xx_context *ctx, struct net_buf *frag)
 {
-	rf2xx_ack_psdu[0] = ACK_FRAME_TYPE;
-	rf2xx_ack_psdu[2] = seq_number;
-
-	if (ctx->trx_trac == RF2XX_TRX_PHY_STATE_TRAC_SUCCESS_DATA_PENDING) {
-		rf2xx_ack_psdu[0] |=  ACK_FRAME_PENDING_BIT;
+	if ((frag->data[0] & RF2XX_FRAME_CTRL_ACK_REQUEST_BIT) == 0) {
+		return;
 	}
 
-	rf2xx_ack_frame.data = rf2xx_ack_psdu;
+	rf2xx_ack_psdu[0] = RF2XX_ACK_FRAME_TYPE;
+	rf2xx_ack_psdu[2] = frag->data[2];
 
-	if (ieee802154_radio_handle_ack(ctx->iface, rf2xx_ack_pkt) != NET_OK) {
+	if (ctx->trx_trac == RF2XX_TRX_PHY_STATE_TRAC_SUCCESS_DATA_PENDING) {
+		rf2xx_ack_psdu[0] |= RF2XX_ACK_FRAME_PENDING_BIT;
+	}
+
+	net_pkt_cursor_init(&rf2xx_ack_pkt);
+
+	if (ieee802154_radio_handle_ack(ctx->iface, &rf2xx_ack_pkt) != NET_OK) {
 		LOG_INF("ACK packet not handled.");
 	}
 }
@@ -428,43 +473,26 @@ static void rf2xx_handle_ack(struct rf2xx_context *ctx, u8_t seq_number)
 #endif
 
 static int rf2xx_tx(struct device *dev,
+		    enum ieee802154_tx_mode mode,
 		    struct net_pkt *pkt,
 		    struct net_buf *frag)
 {
 	ARG_UNUSED(pkt);
 
 	struct rf2xx_context *ctx = dev->driver_data;
-	bool abort = true;
 	int response = 0;
 
-	k_mutex_lock(&ctx->phy_mutex, K_FOREVER);
-	/* Reset semaphore in case ACK was received after timeout */
+	if (mode != IEEE802154_TX_MODE_CSMA_CA) {
+		NET_ERR("TX mode %d not supported", mode);
+		return -ENOTSUP;
+	}
+
+	rf2xx_trx_set_tx_state(dev);
+	rf2xx_iface_reg_read(dev, RF2XX_IRQ_STATUS_REG);
+
 	k_sem_reset(&ctx->trx_tx_sync);
-
-	if (ctx->trx_state == RF2XX_TRX_PHY_STATE_IDLE) {
-		ctx->trx_state = RF2XX_TRX_PHY_BUSY_TX;
-		abort = false;
-
-		/**
-		 * Set extended TX mode
-		 * Datasheet: chapter 7.2 Extended Operating Mode
-		 */
-		rf2xx_trx_set_state(dev, RF2XX_TRX_PHY_STATE_CMD_TX_ARET_ON);
-		rf2xx_iface_reg_read(dev, RF2XX_IRQ_STATUS_REG);
-		rf2xx_iface_frame_write(dev, frag->data, frag->len);
-		rf2xx_iface_phy_tx_start(dev);
-	}
-
-	k_mutex_unlock(&ctx->phy_mutex);
-
-	if (abort) {
-		LOG_DBG("TX Abort, TRX isn't idle!");
-		return -EBUSY;
-	}
-
-	/**
-	 * Wait transceiver...
-	 */
+	rf2xx_iface_frame_write(dev, frag->data, frag->len);
+	rf2xx_iface_phy_tx_start(dev);
 	k_sem_take(&ctx->trx_tx_sync, K_FOREVER);
 
 	switch (ctx->trx_trac) {
@@ -494,7 +522,7 @@ static int rf2xx_tx(struct device *dev,
 	 * acknowledgment frame was set.
 	 */
 	default:
-		rf2xx_handle_ack(ctx, frag->data[2]);
+		rf2xx_handle_ack(ctx, frag);
 		break;
 	}
 
@@ -506,11 +534,11 @@ static int rf2xx_start(struct device *dev)
 	const struct rf2xx_config *conf = dev->config->config_info;
 	struct rf2xx_context *ctx = dev->driver_data;
 
-	k_mutex_lock(&ctx->phy_mutex, K_FOREVER);
+	rf2xx_trx_set_state(dev, RF2XX_TRX_PHY_STATE_CMD_TRX_OFF);
+	rf2xx_iface_reg_read(dev, RF2XX_IRQ_STATUS_REG);
 	gpio_pin_interrupt_configure(ctx->irq_gpio, conf->irq.pin,
 				     GPIO_INT_EDGE_TO_ACTIVE);
 	rf2xx_trx_set_rx_state(dev);
-	k_mutex_unlock(&ctx->phy_mutex);
 
 	return 0;
 }
@@ -520,11 +548,10 @@ static int rf2xx_stop(struct device *dev)
 	const struct rf2xx_config *conf = dev->config->config_info;
 	struct rf2xx_context *ctx = dev->driver_data;
 
-	k_mutex_lock(&ctx->phy_mutex, K_FOREVER);
 	gpio_pin_interrupt_configure(ctx->irq_gpio, conf->irq.pin,
 				     GPIO_INT_DISABLE);
 	rf2xx_trx_set_state(dev, RF2XX_TRX_PHY_STATE_CMD_TRX_OFF);
-	k_mutex_unlock(&ctx->phy_mutex);
+	rf2xx_iface_reg_read(dev, RF2XX_IRQ_STATUS_REG);
 
 	return 0;
 }
@@ -544,8 +571,6 @@ static int power_on_and_setup(struct device *dev)
 	const struct rf2xx_config *conf = dev->config->config_info;
 	struct rf2xx_context *ctx = dev->driver_data;
 	u8_t config;
-
-	ctx->trx_state = RF2XX_TRX_PHY_STATE_IDLE;
 
 	rf2xx_iface_phy_rst(dev);
 
@@ -721,11 +746,8 @@ static int rf2xx_init(struct device *dev)
 
 	LOG_DBG("\nInitialize RF2XX Transceiver\n");
 
-	k_mutex_init(&ctx->phy_mutex);
 	k_sem_init(&ctx->trx_tx_sync, 0, 1);
 	k_sem_init(&ctx->trx_isr_lock, 0, 1);
-	k_timer_init(&ctx->trx_isr_timeout, trx_isr_timeout, NULL);
-	k_timer_user_data_set(&ctx->trx_isr_timeout, ctx);
 
 	if (configure_gpios(dev) != 0) {
 		LOG_ERR("Configuring GPIOS failed");
@@ -797,80 +819,66 @@ static struct ieee802154_radio_api rf2xx_radio_api = {
 #endif /* CONFIG_IEEE802154_RAW_MODE */
 
 /*
- * Optional features place holders
+ * Optional features place holders, get a 0 if the "gpio" doesn't exist
  */
-#ifndef DT_INST_0_ATMEL_RF2XX_DIG2_GPIOS_CONTROLLER
-#define DT_INST_0_ATMEL_RF2XX_DIG2_GPIOS_CONTROLLER 0
-#define DT_INST_0_ATMEL_RF2XX_DIG2_GPIOS_PIN        0
-#define DT_INST_0_ATMEL_RF2XX_DIG2_GPIOS_FLAGS      0
-#endif
-#ifndef DT_INST_1_ATMEL_RF2XX_DIG2_GPIOS_CONTROLLER
-#define DT_INST_1_ATMEL_RF2XX_DIG2_GPIOS_CONTROLLER 0
-#define DT_INST_1_ATMEL_RF2XX_DIG2_GPIOS_PIN        0
-#define DT_INST_1_ATMEL_RF2XX_DIG2_GPIOS_FLAGS      0
-#endif
-#ifndef DT_INST_0_ATMEL_RF2XX_CLKM_GPIOS_CONTROLLER
-#define DT_INST_0_ATMEL_RF2XX_CLKM_GPIOS_CONTROLLER 0
-#define DT_INST_0_ATMEL_RF2XX_CLKM_GPIOS_PIN        0
-#define DT_INST_0_ATMEL_RF2XX_CLKM_GPIOS_FLAGS      0
-#endif
-#ifndef DT_INST_1_ATMEL_RF2XX_CLKM_GPIOS_CONTROLLER
-#define DT_INST_1_ATMEL_RF2XX_CLKM_GPIOS_CONTROLLER 0
-#define DT_INST_1_ATMEL_RF2XX_CLKM_GPIOS_PIN        0
-#define DT_INST_1_ATMEL_RF2XX_CLKM_GPIOS_FLAGS      0
-#endif
-#ifndef DT_INST_0_ATMEL_RF2XX_CS_GPIOS_CONTROLLER
-#define DT_INST_0_ATMEL_RF2XX_CS_GPIOS_CONTROLLER   0
-#define DT_INST_0_ATMEL_RF2XX_CS_GPIOS_PIN          0
-#define DT_INST_0_ATMEL_RF2XX_CS_GPIOS_FLAGS        0
-#endif
-#ifndef DT_INST_1_ATMEL_RF2XX_CS_GPIOS_CONTROLLER
-#define DT_INST_1_ATMEL_RF2XX_CS_GPIOS_CONTROLLER   0
-#define DT_INST_1_ATMEL_RF2XX_CS_GPIOS_PIN          0
-#define DT_INST_1_ATMEL_RF2XX_CS_GPIOS_FLAGS        0
-#endif
+#define DRV_INST_GPIO_LABEL(n, gpio_pha)	     \
+	UTIL_AND(DT_INST_NODE_HAS_PROP(n, gpio_pha), \
+		 DT_INST_GPIO_LABEL(n, gpio_pha))
+#define DRV_INST_GPIO_PIN(n, gpio_pha)	             \
+	UTIL_AND(DT_INST_NODE_HAS_PROP(n, gpio_pha), \
+		 DT_INST_GPIO_PIN(n, gpio_pha))
+#define DRV_INST_GPIO_FLAGS(n, gpio_pha)	     \
+	UTIL_AND(DT_INST_NODE_HAS_PROP(n, gpio_pha), \
+		 DT_INST_GPIO_FLAGS(n, gpio_pha))
+#define DRV_INST_SPI_DEV_CS_GPIOS_LABEL(n)           \
+	UTIL_AND(DT_INST_SPI_DEV_HAS_CS_GPIOS(n),    \
+		 DT_INST_SPI_DEV_CS_GPIOS_LABEL(n))
+#define DRV_INST_SPI_DEV_CS_GPIOS_PIN(n)             \
+	UTIL_AND(DT_INST_SPI_DEV_HAS_CS_GPIOS(n),    \
+		 DT_INST_SPI_DEV_CS_GPIOS_PIN(n))
+#define DRV_INST_SPI_DEV_CS_GPIOS_FLAGS(n)           \
+	UTIL_AND(DT_INST_SPI_DEV_HAS_CS_GPIOS(n),    \
+		 DT_INST_SPI_DEV_CS_GPIOS_FLAGS(n))
 
 #define IEEE802154_RF2XX_DEVICE_CONFIG(n)					   \
 	static const struct rf2xx_config rf2xx_ctx_config_##n = {		   \
 		.inst = n,							   \
 										   \
-		.irq.devname = DT_INST_##n##_ATMEL_RF2XX_IRQ_GPIOS_CONTROLLER,	   \
-		.irq.pin = DT_INST_##n##_ATMEL_RF2XX_IRQ_GPIOS_PIN,		   \
-		.irq.flags = DT_INST_##n##_ATMEL_RF2XX_IRQ_GPIOS_FLAGS,		   \
+		.irq.devname = DRV_INST_GPIO_LABEL(n, irq_gpios),		   \
+		.irq.pin = DRV_INST_GPIO_PIN(n, irq_gpios),			   \
+		.irq.flags = DRV_INST_GPIO_FLAGS(n, irq_gpios),			   \
 										   \
-		.reset.devname = DT_INST_##n##_ATMEL_RF2XX_RESET_GPIOS_CONTROLLER, \
-		.reset.pin = DT_INST_##n##_ATMEL_RF2XX_RESET_GPIOS_PIN,		   \
-		.reset.flags = DT_INST_##n##_ATMEL_RF2XX_RESET_GPIOS_FLAGS,	   \
+		.reset.devname = DRV_INST_GPIO_LABEL(n, reset_gpios),		   \
+		.reset.pin = DRV_INST_GPIO_PIN(n, reset_gpios),			   \
+		.reset.flags = DRV_INST_GPIO_FLAGS(n, reset_gpios),		   \
 										   \
-		.slptr.devname = DT_INST_##n##_ATMEL_RF2XX_SLPTR_GPIOS_CONTROLLER, \
-		.slptr.pin = DT_INST_##n##_ATMEL_RF2XX_SLPTR_GPIOS_PIN,		   \
-		.slptr.flags = DT_INST_##n##_ATMEL_RF2XX_SLPTR_GPIOS_FLAGS,	   \
+		.slptr.devname = DRV_INST_GPIO_LABEL(n, slptr_gpios),		   \
+		.slptr.pin = DRV_INST_GPIO_PIN(n, slptr_gpios),			   \
+		.slptr.flags = DRV_INST_GPIO_FLAGS(n, slptr_gpios),		   \
 										   \
-		.dig2.devname = DT_INST_##n##_ATMEL_RF2XX_DIG2_GPIOS_CONTROLLER,   \
-		.dig2.pin = DT_INST_##n##_ATMEL_RF2XX_DIG2_GPIOS_PIN,		   \
-		.dig2.flags = DT_INST_##n##_ATMEL_RF2XX_DIG2_GPIOS_FLAGS,	   \
+		.dig2.devname = DRV_INST_GPIO_LABEL(n, dig2_gpios),		   \
+		.dig2.pin = DRV_INST_GPIO_PIN(n, dig2_gpios),			   \
+		.dig2.flags = DRV_INST_GPIO_FLAGS(n, dig2_gpios),		   \
 										   \
-		.clkm.devname = DT_INST_##n##_ATMEL_RF2XX_CLKM_GPIOS_CONTROLLER,   \
-		.clkm.pin = DT_INST_##n##_ATMEL_RF2XX_CLKM_GPIOS_PIN,		   \
-		.clkm.flags = DT_INST_##n##_ATMEL_RF2XX_CLKM_GPIOS_FLAGS,	   \
+		.clkm.devname = DRV_INST_GPIO_LABEL(n, clkm_gpios),		   \
+		.clkm.pin = DRV_INST_GPIO_PIN(n, clkm_gpios),			   \
+		.clkm.flags = DRV_INST_GPIO_FLAGS(n, clkm_gpios),		   \
 										   \
-		.spi.devname = DT_INST_##n##_ATMEL_RF2XX_BUS_NAME,		   \
-		.spi.addr = DT_INST_##n##_ATMEL_RF2XX_BASE_ADDRESS,		   \
-		.spi.freq = DT_INST_##n##_ATMEL_RF2XX_SPI_MAX_FREQUENCY,	   \
-		.spi.cs.devname = DT_INST_##n##_ATMEL_RF2XX_CS_GPIOS_CONTROLLER,   \
-		.spi.cs.pin = DT_INST_##n##_ATMEL_RF2XX_CS_GPIOS_PIN,		   \
-		.spi.cs.flags = DT_INST_##n##_ATMEL_RF2XX_CS_GPIOS_FLAGS,	   \
-	}
+		.spi.devname = DT_INST_BUS_LABEL(n),				   \
+		.spi.addr = DT_INST_REG_ADDR(n),				   \
+		.spi.freq = DT_INST_PROP(n, spi_max_frequency),			   \
+		.spi.cs.devname = DRV_INST_SPI_DEV_CS_GPIOS_LABEL(n),		   \
+		.spi.cs.pin = DRV_INST_SPI_DEV_CS_GPIOS_PIN(n),			   \
+		.spi.cs.flags = DRV_INST_SPI_DEV_CS_GPIOS_FLAGS(n),		   \
+	};
 
 #define IEEE802154_RF2XX_DEVICE_DATA(n)			   \
-	static struct rf2xx_context rf2xx_ctx_data_##n = { \
-		.trx_state = RF2XX_TRX_PHY_STATE_INITIAL,  \
-	}
+	static struct rf2xx_context rf2xx_ctx_data_##n;
 
 #define IEEE802154_RF2XX_RAW_DEVICE_INIT(n)	   \
 	DEVICE_AND_API_INIT(			   \
 		rf2xx_##n,			   \
-		DT_INST_##n##_ATMEL_RF2XX_LABEL,   \
+		DT_INST_LABEL(n),		   \
 		&rf2xx_init,			   \
 		&rf2xx_ctx_data_##n,		   \
 		&rf2xx_ctx_config_##n,		   \
@@ -881,8 +889,9 @@ static struct ieee802154_radio_api rf2xx_radio_api = {
 #define IEEE802154_RF2XX_NET_DEVICE_INIT(n)	   \
 	NET_DEVICE_INIT(			   \
 		rf2xx_##n,			   \
-		DT_INST_##n##_ATMEL_RF2XX_LABEL,   \
+		DT_INST_LABEL(n),		   \
 		&rf2xx_init,			   \
+		device_pm_control_nop,		   \
 		&rf2xx_ctx_data_##n,		   \
 		&rf2xx_ctx_config_##n,		   \
 		CONFIG_IEEE802154_RF2XX_INIT_PRIO, \
@@ -891,7 +900,7 @@ static struct ieee802154_radio_api rf2xx_radio_api = {
 		L2_CTX_TYPE,			   \
 		MTU)
 
-#if DT_INST_0_ATMEL_RF2XX
+#if DT_HAS_DRV_INST(0)
 	IEEE802154_RF2XX_DEVICE_CONFIG(0);
 	IEEE802154_RF2XX_DEVICE_DATA(0);
 
@@ -902,7 +911,7 @@ static struct ieee802154_radio_api rf2xx_radio_api = {
 	#endif /* CONFIG_IEEE802154_RAW_MODE */
 #endif
 
-#if DT_INST_1_ATMEL_RF2XX
+#if DT_HAS_DRV_INST(1)
 	IEEE802154_RF2XX_DEVICE_CONFIG(1);
 	IEEE802154_RF2XX_DEVICE_DATA(1);
 

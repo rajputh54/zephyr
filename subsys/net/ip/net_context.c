@@ -441,6 +441,10 @@ static int bind_default(struct net_context *context)
 	if (IS_ENABLED(CONFIG_NET_SOCKETS_PACKET) && family == AF_PACKET) {
 		struct sockaddr_ll ll_addr;
 
+		if (net_sll_ptr(&context->local)->sll_addr) {
+			return 0;
+		}
+
 		ll_addr.sll_family = AF_PACKET;
 		ll_addr.sll_protocol = ETH_P_ALL;
 		ll_addr.sll_ifindex = net_if_get_by_iface(net_if_get_default());
@@ -820,9 +824,10 @@ int net_context_create_ipv4_new(struct net_context *context,
 				const struct in_addr *src,
 				const struct in_addr *dst)
 {
-	NET_ASSERT(((struct sockaddr_in_ptr *)&context->local)->sin_addr);
-
 	if (!src) {
+		NET_ASSERT(((
+			struct sockaddr_in_ptr *)&context->local)->sin_addr);
+
 		src = ((struct sockaddr_in_ptr *)&context->local)->sin_addr;
 	}
 
@@ -849,9 +854,10 @@ int net_context_create_ipv6_new(struct net_context *context,
 				const struct in6_addr *src,
 				const struct in6_addr *dst)
 {
-	NET_ASSERT(((struct sockaddr_in6_ptr *)&context->local)->sin6_addr);
-
 	if (!src) {
+		NET_ASSERT(((
+			struct sockaddr_in6_ptr *)&context->local)->sin6_addr);
+
 		src = ((struct sockaddr_in6_ptr *)&context->local)->sin6_addr;
 	}
 
@@ -901,7 +907,8 @@ int net_context_connect(struct net_context *context,
 
 	if (IS_ENABLED(CONFIG_NET_SOCKETS_PACKET) &&
 	    addr->sa_family == AF_PACKET) {
-		return -EOPNOTSUPP;
+		ret = -EOPNOTSUPP;
+		goto unlock;
 	}
 
 	if (net_context_get_state(context) == NET_CONTEXT_LISTENING) {
@@ -1568,14 +1575,7 @@ static int context_sendto(struct net_context *context,
 		ret = net_send_data(pkt);
 	} else if (IS_ENABLED(CONFIG_NET_TCP) &&
 		   net_context_get_ip_proto(context) == IPPROTO_TCP) {
-#if IS_ENABLED(CONFIG_NET_TCP2)
-		ret = net_tcp_queue(context, buf, len, msghdr);
-		if (ret < 0) {
-			goto fail;
-		}
 
-		net_pkt_unref(pkt);
-#else
 		ret = context_write_data(pkt, buf, len, msghdr);
 		if (ret < 0) {
 			goto fail;
@@ -1586,7 +1586,6 @@ static int context_sendto(struct net_context *context,
 		if (ret < 0) {
 			goto fail;
 		}
-#endif
 
 		ret = net_tcp_send_data(context, cb, user_data);
 	} else if (IS_ENABLED(CONFIG_NET_SOCKETS_PACKET) &&
@@ -1916,7 +1915,19 @@ int net_context_recv(struct net_context *context,
 	} else {
 		if (IS_ENABLED(CONFIG_NET_SOCKETS_PACKET) &&
 		    net_context_get_family(context) == AF_PACKET) {
-			ret = recv_raw(context, cb, timeout, NULL, user_data);
+			struct sockaddr_ll addr;
+
+			addr.sll_family = AF_PACKET;
+			addr.sll_ifindex =
+				net_sll_ptr(&context->local)->sll_ifindex;
+			addr.sll_protocol =
+				net_sll_ptr(&context->local)->sll_protocol;
+			memcpy(addr.sll_addr,
+			       net_sll_ptr(&context->local)->sll_addr,
+			       sizeof(addr.sll_addr));
+
+			ret = recv_raw(context, cb, timeout,
+				       (struct sockaddr *)&addr, user_data);
 		} else if (IS_ENABLED(CONFIG_NET_SOCKETS_CAN) &&
 			   net_context_get_family(context) == AF_CAN) {
 			struct sockaddr_can local_addr = {

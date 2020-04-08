@@ -170,14 +170,14 @@ static inline int mesh_x_set(settings_read_cb read_cb, void *cb_arg, void *out,
 
 	len = read_cb(cb_arg, out, read_len);
 	if (len < 0) {
-		BT_ERR("Failed to read value (err %zu)", len);
+		BT_ERR("Failed to read value (err %zd)", len);
 		return len;
 	}
 
 	BT_HEXDUMP_DBG(out, len, "val");
 
 	if (len != read_len) {
-		BT_ERR("Unexpected value length (%zu != %zu)", len, read_len);
+		BT_ERR("Unexpected value length (%zd != %zu)", len, read_len);
 		return -EINVAL;
 	}
 
@@ -574,7 +574,7 @@ static int mod_set_bind(struct bt_mesh_model *mod, size_t len_rd,
 
 	len = read_cb(cb_arg, mod->keys, sizeof(mod->keys));
 	if (len < 0) {
-		BT_ERR("Failed to read value (err %zu)", len);
+		BT_ERR("Failed to read value (err %zd)", len);
 		return len;
 	}
 
@@ -598,7 +598,7 @@ static int mod_set_sub(struct bt_mesh_model *mod, size_t len_rd,
 
 	len = read_cb(cb_arg, mod->groups, sizeof(mod->groups));
 	if (len < 0) {
-		BT_ERR("Failed to read value (err %zu)", len);
+		BT_ERR("Failed to read value (err %zd)", len);
 		return len;
 	}
 
@@ -2260,6 +2260,7 @@ void bt_mesh_store_cdb_node(const struct bt_mesh_cdb_node *node)
 	}
 
 	free_slot->addr = node->addr;
+	free_slot->clear = false;
 
 	schedule_cdb_store(BT_MESH_CDB_NODES_PENDING);
 }
@@ -2298,7 +2299,7 @@ static struct key_update *cdb_key_update_find(bool app_key, u16_t key_idx,
 	match = NULL;
 	*free_slot = NULL;
 
-	for (i = 0; i < ARRAY_SIZE(key_updates); i++) {
+	for (i = 0; i < ARRAY_SIZE(cdb_key_updates); i++) {
 		struct key_update *update = &cdb_key_updates[i];
 
 		if (!update->valid) {

@@ -11,11 +11,10 @@
  *
  */
 
-#define LOG_LEVEL CONFIG_OPENTHREAD_LOG_LEVEL
 #define LOG_MODULE_NAME net_otPlat_radio
 
 #include <logging/log.h>
-LOG_MODULE_REGISTER(LOG_MODULE_NAME);
+LOG_MODULE_REGISTER(LOG_MODULE_NAME, CONFIG_OPENTHREAD_L2_LOG_LEVEL);
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -43,6 +42,21 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 #define FRAME_TYPE_MASK 0x07
 #define FRAME_TYPE_ACK 0x02
 
+#define OT_WORKER_STACK_SIZE 512
+#define OT_WORKER_PRIORITY   K_PRIO_COOP(CONFIG_OPENTHREAD_THREAD_PRIORITY)
+
+enum pending_events {
+	PENDING_EVENT_TX_STARTED, /* Radio has started transmitting */
+	PENDING_EVENT_TX_DONE, /* Radio transmission finished */
+	PENDING_EVENT_DETECT_ENERGY, /* Requested to start Energy Detection
+				      * procedure.
+				      */
+	PENDING_EVENT_DETECT_ENERGY_DONE, /* Energy Detection finished. */
+	PENDING_EVENT_COUNT /* keep last */
+};
+
+K_SEM_DEFINE(radio_sem, 0, 1);
+
 static otRadioState sState = OT_RADIO_STATE_DISABLED;
 
 static otRadioFrame sTransmitFrame;
@@ -57,6 +71,45 @@ static struct ieee802154_radio_api *radio_api;
 
 static s8_t tx_power;
 static u16_t channel;
+static bool promiscuous;
+
+static u16_t energy_detection_time;
+static u8_t  energy_detection_channel;
+static s16_t energy_detected_value;
+
+ATOMIC_DEFINE(pending_events, PENDING_EVENT_COUNT);
+K_THREAD_STACK_DEFINE(ot_task_stack, OT_WORKER_STACK_SIZE);
+static struct k_work_q ot_work_q;
+static otError tx_result;
+
+static inline bool is_pending_event_set(enum pending_events event)
+{
+	return atomic_test_bit(pending_events, event);
+}
+
+static void set_pending_event(enum pending_events event)
+{
+	atomic_set_bit(pending_events, event);
+	otSysEventSignalPending();
+}
+
+static void reset_pending_event(enum pending_events event)
+{
+	atomic_clear_bit(pending_events, event);
+}
+
+static inline void clear_pending_events(void)
+{
+	atomic_clear(pending_events);
+}
+
+void energy_detected(struct device *dev, s16_t max_ed)
+{
+	if (dev == radio_dev) {
+		energy_detected_value = max_ed;
+		set_pending_event(PENDING_EVENT_DETECT_ENERGY_DONE);
+	}
+}
 
 enum net_verdict ieee802154_radio_handle_ack(struct net_if *iface,
 					     struct net_pkt *pkt)
@@ -90,6 +143,23 @@ enum net_verdict ieee802154_radio_handle_ack(struct net_if *iface,
 	return NET_OK;
 }
 
+void handle_radio_event(struct device *dev, enum ieee802154_event evt,
+			void *event_params)
+{
+	ARG_UNUSED(event_params);
+
+	switch (evt) {
+	case IEEE802154_EVENT_TX_STARTED:
+		if (sState == OT_RADIO_STATE_TRANSMIT) {
+			set_pending_event(PENDING_EVENT_TX_STARTED);
+		}
+		break;
+	default:
+		/* do nothing - ignore event */
+		break;
+	}
+}
+
 static void dataInit(void)
 {
 	tx_pkt = net_pkt_alloc(K_NO_WAIT);
@@ -105,6 +175,8 @@ static void dataInit(void)
 
 void platformRadioInit(void)
 {
+	struct ieee802154_config cfg;
+
 	dataInit();
 
 	radio_dev = device_get_binding(CONFIG_NET_CONFIG_IEEE802154_DEV_NAME);
@@ -115,74 +187,149 @@ void platformRadioInit(void)
 		return;
 	}
 
-	__ASSERT(radio_api->get_capabilities(radio_dev)
-		 & IEEE802154_HW_TX_RX_ACK,
-		 "Only radios with automatic ack handling "
-		 "are currently supported");
+	k_work_q_start(&ot_work_q, ot_task_stack,
+		       K_THREAD_STACK_SIZEOF(ot_task_stack),
+		       OT_WORKER_PRIORITY);
+
+	if ((radio_api->get_capabilities(radio_dev) &
+	     IEEE802154_HW_TX_RX_ACK) != IEEE802154_HW_TX_RX_ACK) {
+		LOG_ERR("Only radios with automatic ack handling "
+			"are currently supported");
+		k_panic();
+	}
+
+	cfg.event_handler = handle_radio_event;
+	radio_api->configure(radio_dev, IEEE802154_CONFIG_EVENT_HANDLER, &cfg);
+}
+
+void transmit_message(struct k_work *tx_job)
+{
+	ARG_UNUSED(tx_job);
+
+	tx_result = OT_ERROR_NONE;
+	/*
+	 * The payload is already in tx_payload->data,
+	 * but we need to set the length field
+	 * according to sTransmitFrame.length.
+	 * We subtract the FCS size as radio driver
+	 * adds CRC and increases frame length on its own.
+	 */
+	tx_payload->len = sTransmitFrame.mLength - FCS_SIZE;
+
+	channel = sTransmitFrame.mChannel;
+
+	radio_api->set_channel(radio_dev, sTransmitFrame.mChannel);
+	radio_api->set_txpower(radio_dev, tx_power);
+
+	if (sTransmitFrame.mInfo.mTxInfo.mCsmaCaEnabled) {
+		if (radio_api->get_capabilities(radio_dev) &
+		    IEEE802154_HW_CSMA) {
+			if (radio_api->tx(radio_dev,
+					  IEEE802154_TX_MODE_CSMA_CA,
+					  tx_pkt, tx_payload) != 0) {
+				tx_result = OT_ERROR_CHANNEL_ACCESS_FAILURE;
+			}
+		} else if (radio_api->cca(radio_dev) != 0 ||
+			   radio_api->tx(radio_dev, IEEE802154_TX_MODE_DIRECT,
+					 tx_pkt, tx_payload) != 0) {
+			tx_result = OT_ERROR_CHANNEL_ACCESS_FAILURE;
+		}
+	} else {
+		if (radio_api->tx(radio_dev, IEEE802154_TX_MODE_DIRECT,
+				  tx_pkt, tx_payload)) {
+			tx_result = OT_ERROR_CHANNEL_ACCESS_FAILURE;
+		}
+	}
+
+	set_pending_event(PENDING_EVENT_TX_DONE);
+}
+
+static inline void handle_tx_done(otInstance *aInstance)
+{
+	if (IS_ENABLED(OPENTHREAD_ENABLE_DIAG) && otPlatDiagModeGet()) {
+		otPlatDiagRadioTransmitDone(aInstance, &sTransmitFrame,
+					tx_result);
+	} else {
+		if (sTransmitFrame.mPsdu[0] & IEEE802154_AR_FLAG_SET) {
+
+
+			if (ack_frame.mLength == 0) {
+				LOG_DBG("No ACK received.");
+				otPlatRadioTxDone(aInstance, &sTransmitFrame,
+						  NULL, OT_ERROR_NO_ACK);
+			} else {
+				otPlatRadioTxDone(aInstance, &sTransmitFrame,
+						  &ack_frame, tx_result);
+			}
+		} else {
+			otPlatRadioTxDone(aInstance, &sTransmitFrame, NULL,
+					  tx_result);
+		}
+		ack_frame.mLength = 0;
+	}
+}
+
+
+static int run_tx_task(otInstance *aInstance)
+{
+	static struct k_work tx_job;
+
+	ARG_UNUSED(aInstance);
+
+	if (k_work_pending(&tx_job) == 0) {
+		sState = OT_RADIO_STATE_TRANSMIT;
+
+		k_work_init(&tx_job, transmit_message);
+		k_work_submit_to_queue(&ot_work_q, &tx_job);
+		return 0;
+	} else {
+		return -EBUSY;
+	}
 }
 
 void platformRadioProcess(otInstance *aInstance)
 {
-	if (sState == OT_RADIO_STATE_TRANSMIT) {
-		otError result = OT_ERROR_NONE;
+	bool event_pending = false;
 
-		/*
-		 * The payload is already in tx_payload->data,
-		 * but we need to set the length field
-		 * according to sTransmitFrame.length.
-		 * We subtract the FCS size as radio driver
-		 * adds CRC and increases frame length on its own.
-		 */
-		tx_payload->len = sTransmitFrame.mLength - FCS_SIZE;
+	if (is_pending_event_set(PENDING_EVENT_TX_STARTED)) {
+		reset_pending_event(PENDING_EVENT_TX_STARTED);
+		otPlatRadioTxStarted(aInstance, &sTransmitFrame);
+	}
 
-		channel = sTransmitFrame.mChannel;
+	if (is_pending_event_set(PENDING_EVENT_TX_DONE)) {
+		reset_pending_event(PENDING_EVENT_TX_DONE);
 
-		radio_api->set_channel(radio_dev, sTransmitFrame.mChannel);
-		radio_api->set_txpower(radio_dev, tx_power);
-
-		if (sTransmitFrame.mInfo.mTxInfo.mCsmaCaEnabled) {
-			if (radio_api->cca(radio_dev) ||
-			    radio_api->tx(radio_dev, tx_pkt, tx_payload)) {
-				result = OT_ERROR_CHANNEL_ACCESS_FAILURE;
-			}
-		} else {
-			if (radio_api->tx(radio_dev, tx_pkt, tx_payload)) {
-				result = OT_ERROR_CHANNEL_ACCESS_FAILURE;
-			}
+		if (sState == OT_RADIO_STATE_TRANSMIT) {
+			sState = OT_RADIO_STATE_RECEIVE;
+			handle_tx_done(aInstance);
 		}
+	}
 
-		sState = OT_RADIO_STATE_RECEIVE;
+	/* handle events that can't run during transmission */
+	if (sState != OT_RADIO_STATE_TRANSMIT) {
+		if (is_pending_event_set(PENDING_EVENT_DETECT_ENERGY)) {
+			radio_api->set_channel(radio_dev,
+					       energy_detection_channel);
 
-#if OPENTHREAD_ENABLE_DIAG
-
-		if (otPlatDiagModeGet()) {
-			otPlatDiagRadioTransmitDone(aInstance, &sTransmitFrame,
-						    result);
-		} else
-#endif
-		{
-			if (sTransmitFrame.mPsdu[0] & IEEE802154_AR_FLAG_SET) {
-				if (ack_frame.mLength == 0) {
-					LOG_DBG("No ACK received.");
-
-					result = OT_ERROR_NO_ACK;
-
-					otPlatRadioTxDone(aInstance,
-							  &sTransmitFrame,
-							  NULL, result);
-
-					return;
-				}
-
-				otPlatRadioTxDone(aInstance, &sTransmitFrame,
-						  &ack_frame, result);
-
-				ack_frame.mLength = 0;
+			if (!radio_api->ed_scan(radio_dev,
+						energy_detection_time,
+						energy_detected)) {
+				reset_pending_event(
+					PENDING_EVENT_DETECT_ENERGY);
 			} else {
-				otPlatRadioTxDone(aInstance, &sTransmitFrame,
-						  NULL, result);
+				event_pending = true;
 			}
 		}
+
+		if (is_pending_event_set(PENDING_EVENT_DETECT_ENERGY_DONE)) {
+			otPlatRadioEnergyScanDone(aInstance,
+						(s8_t)energy_detected_value);
+			reset_pending_event(PENDING_EVENT_DETECT_ENERGY_DONE);
+		}
+	}
+
+	if (event_pending) {
+		otSysEventSignalPending();
 	}
 }
 
@@ -284,9 +431,9 @@ otError otPlatRadioTransmit(otInstance *aInstance, otRadioFrame *aPacket)
 	__ASSERT_NO_MSG(aPacket == &sTransmitFrame);
 
 	if (sState == OT_RADIO_STATE_RECEIVE) {
-		error = OT_ERROR_NONE;
-		sState = OT_RADIO_STATE_TRANSMIT;
-		otSysEventSignalPending();
+		if (run_tx_task(aInstance) == 0) {
+			error = OT_ERROR_NONE;
+		}
 	}
 
 	return error;
@@ -299,47 +446,137 @@ otRadioFrame *otPlatRadioGetTransmitBuffer(otInstance *aInstance)
 	return &sTransmitFrame;
 }
 
+static void get_rssi_energy_detected(struct device *dev, s16_t max_ed)
+{
+	ARG_UNUSED(dev);
+	energy_detected_value = max_ed;
+	k_sem_give(&radio_sem);
+}
+
 int8_t otPlatRadioGetRssi(otInstance *aInstance)
 {
+	s8_t ret_rssi = INT8_MAX;
+	int error = 0;
+	const u16_t energy_detection_time = 1;
+	enum ieee802154_hw_caps radio_caps;
 	ARG_UNUSED(aInstance);
 
-	/* TODO: No API in Zephyr to get the RSSI. */
-	return 0;
+	radio_caps = radio_api->get_capabilities(radio_dev);
+
+	if (!(radio_caps & IEEE802154_HW_ENERGY_SCAN)) {
+		/*
+		 * TODO: No API in Zephyr to get the RSSI
+		 * when IEEE802154_HW_ENERGY_SCAN is not available
+		 */
+		ret_rssi = 0;
+	} else {
+		/*
+		 * Blocking implementation of get RSSI
+		 * using no-blocking ed_scan
+		 */
+		error = radio_api->ed_scan(radio_dev, energy_detection_time,
+					   get_rssi_energy_detected);
+
+		if (error == 0) {
+			k_sem_take(&radio_sem, K_FOREVER);
+
+			ret_rssi = (s8_t)energy_detected_value;
+		}
+	}
+
+	return ret_rssi;
 }
 
 otRadioCaps otPlatRadioGetCaps(otInstance *aInstance)
 {
-	ARG_UNUSED(aInstance);
+	otRadioCaps caps = OT_RADIO_CAPS_NONE;
 
-	return OT_RADIO_CAPS_NONE;
+	enum ieee802154_hw_caps radio_caps;
+	ARG_UNUSED(aInstance);
+	__ASSERT(radio_api,
+	    "platformRadioInit needs to be called prior to otPlatRadioGetCaps");
+
+	radio_caps = radio_api->get_capabilities(radio_dev);
+
+	if (radio_caps & IEEE802154_HW_ENERGY_SCAN) {
+		caps |= OT_RADIO_CAPS_ENERGY_SCAN;
+	}
+
+	if (radio_caps & IEEE802154_HW_CSMA) {
+		caps |= OT_RADIO_CAPS_CSMA_BACKOFF |
+			OT_RADIO_CAPS_TRANSMIT_RETRIES;
+	}
+
+	return caps;
 }
 
 bool otPlatRadioGetPromiscuous(otInstance *aInstance)
 {
 	ARG_UNUSED(aInstance);
 
-	/* TODO: No API in Zephyr to get promiscuous mode. */
-	bool result = false;
+	LOG_DBG("PromiscuousMode=%d", promiscuous ? 1 : 0);
 
-	LOG_DBG("PromiscuousMode=%d", result ? 1 : 0);
-	return result;
+	return promiscuous;
 }
 
 void otPlatRadioSetPromiscuous(otInstance *aInstance, bool aEnable)
 {
+	struct ieee802154_config config = {
+		.promiscuous = aEnable
+	};
+
 	ARG_UNUSED(aInstance);
-	ARG_UNUSED(aEnable);
 
 	LOG_DBG("PromiscuousMode=%d", aEnable ? 1 : 0);
-	/* TODO: No API in Zephyr to set promiscuous mode. */
+
+	promiscuous = aEnable;
+	radio_api->configure(radio_dev, IEEE802154_CONFIG_PROMISCUOUS, &config);
 }
 
 otError otPlatRadioEnergyScan(otInstance *aInstance, u8_t aScanChannel,
 			      u16_t aScanDuration)
 {
-	ARG_UNUSED(aInstance);
-	ARG_UNUSED(aScanChannel);
-	ARG_UNUSED(aScanDuration);
+	energy_detection_time    = aScanDuration;
+	energy_detection_channel = aScanChannel;
+
+	if (radio_api->ed_scan == NULL) {
+		return OT_ERROR_NOT_IMPLEMENTED;
+	}
+
+	reset_pending_event(PENDING_EVENT_DETECT_ENERGY);
+	reset_pending_event(PENDING_EVENT_DETECT_ENERGY_DONE);
+
+	radio_api->set_channel(radio_dev, aScanChannel);
+
+	if (radio_api->ed_scan(radio_dev, energy_detection_time,
+				    energy_detected) != 0) {
+		/*
+		 * OpenThread API does not accept failure of this function,
+		 * it can return 'No Error' or 'Not Implemented' error only.
+		 * If ed_scan start failed event is set to schedule the scan at
+		 * later time.
+		 */
+		LOG_ERR("Failed do start energy scan, scheduling for later");
+		set_pending_event(PENDING_EVENT_DETECT_ENERGY);
+	}
+
+	return OT_ERROR_NONE;
+}
+
+otError otPlatRadioGetCcaEnergyDetectThreshold(otInstance *aInstance,
+					       int8_t *aThreshold)
+{
+	OT_UNUSED_VARIABLE(aInstance);
+	OT_UNUSED_VARIABLE(aThreshold);
+
+	return OT_ERROR_NOT_IMPLEMENTED;
+}
+
+otError otPlatRadioSetCcaEnergyDetectThreshold(otInstance *aInstance,
+					       int8_t aThreshold)
+{
+	OT_UNUSED_VARIABLE(aInstance);
+	OT_UNUSED_VARIABLE(aThreshold);
 
 	return OT_ERROR_NOT_IMPLEMENTED;
 }

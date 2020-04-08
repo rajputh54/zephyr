@@ -12,7 +12,6 @@
 
 / {
 	aliases {
-		rtc-0 = &rtc0;
 		watchdog0 = &wdog0;
 		uart-0 = &uart0;
 		uart-1 = &uart1;
@@ -134,6 +133,16 @@
 			clock-frequency = <32768>;
 			prescaler = <32768>;
 			label = "RTC_0";
+		};
+
+		lptmr0: lptmr@40040000 {
+			compatible = "nxp,kinetis-lptmr";
+			reg = <0x40040000 0x1000>;
+			interrupts = <58 0>;
+			clock-frequency = <128000>;
+			prescaler = <1>;
+			clk-source = <1>;
+			label = "LPTMR_0";
 		};
 
 		wdog0: watchdog@40052000 {
@@ -306,6 +315,7 @@
 			label = "GPIO_0";
 			gpio-controller;
 			#gpio-cells = <2>;
+			nxp,kinetis-port = <&pinmux_a>;
 		};
 
 		gpiob: gpio@400ff040 {
@@ -315,6 +325,7 @@
 			label = "GPIO_1";
 			gpio-controller;
 			#gpio-cells = <2>;
+			nxp,kinetis-port = <&pinmux_b>;
 		};
 
 		gpioc: gpio@400ff080 {
@@ -324,6 +335,7 @@
 			label = "GPIO_2";
 			gpio-controller;
 			#gpio-cells = <2>;
+			nxp,kinetis-port = <&pinmux_c>;
 		};
 
 		gpiod: gpio@400ff0c0 {
@@ -333,6 +345,7 @@
 			label = "GPIO_3";
 			gpio-controller;
 			#gpio-cells = <2>;
+			nxp,kinetis-port = <&pinmux_d>;
 		};
 
 		gpioe: gpio@400ff100 {
@@ -342,6 +355,7 @@
 			label = "GPIO_4";
 			gpio-controller;
 			#gpio-cells = <2>;
+			nxp,kinetis-port = <&pinmux_e>;
 		};
 
 		adc0: adc@4003b000 {

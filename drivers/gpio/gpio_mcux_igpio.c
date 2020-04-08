@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#define DT_DRV_COMPAT nxp_imx_gpio
+
 #include <errno.h>
 #include <device.h>
 #include <drivers/gpio.h>
@@ -121,6 +123,17 @@ static int mcux_igpio_pin_interrupt_configure(struct device *dev,
 	u8_t icr;
 	int shift;
 
+	if (mode == GPIO_INT_MODE_DISABLED) {
+		key = irq_lock();
+
+		WRITE_BIT(base->IMR, pin, 0);
+		WRITE_BIT(data->pin_callback_enables, pin, 0);
+
+		irq_unlock(key);
+
+		return 0;
+	}
+
 	if ((mode == GPIO_INT_MODE_EDGE) && (trig == GPIO_INT_TRIG_LOW)) {
 		icr = 3;
 	} else if ((mode == GPIO_INT_MODE_EDGE) &&
@@ -146,10 +159,9 @@ static int mcux_igpio_pin_interrupt_configure(struct device *dev,
 	key = irq_lock();
 
 	WRITE_BIT(base->EDGE_SEL, pin, trig == GPIO_INT_TRIG_BOTH);
-	WRITE_BIT(base->ISR, pin, mode != GPIO_INT_MODE_DISABLED);
-	WRITE_BIT(base->IMR, pin, mode != GPIO_INT_MODE_DISABLED);
-	WRITE_BIT(data->pin_callback_enables, pin,
-		  mode != GPIO_INT_MODE_DISABLED);
+	WRITE_BIT(base->ISR, pin, 1);
+	WRITE_BIT(base->IMR, pin, 1);
+	WRITE_BIT(data->pin_callback_enables, pin, 1);
 
 	irq_unlock(key);
 
@@ -217,7 +229,7 @@ static int mcux_igpio_1_init(struct device *dev);
 
 static const struct mcux_igpio_config mcux_igpio_1_config = {
 	.common = {
-		.port_pin_mask = GPIO_PORT_PIN_MASK_FROM_NGPIOS(DT_INST_0_NXP_IMX_GPIO_NGPIOS),
+		.port_pin_mask = GPIO_PORT_PIN_MASK_FROM_DT_INST(0),
 	},
 	.base = (GPIO_Type *)DT_NXP_IMX_GPIO_GPIO_1_BASE_ADDRESS,
 };
@@ -255,7 +267,7 @@ static int mcux_igpio_2_init(struct device *dev);
 
 static const struct mcux_igpio_config mcux_igpio_2_config = {
 	.common = {
-		.port_pin_mask = GPIO_PORT_PIN_MASK_FROM_NGPIOS(DT_INST_1_NXP_IMX_GPIO_NGPIOS),
+		.port_pin_mask = GPIO_PORT_PIN_MASK_FROM_DT_INST(1),
 	},
 	.base = (GPIO_Type *)DT_NXP_IMX_GPIO_GPIO_2_BASE_ADDRESS,
 };
@@ -293,7 +305,7 @@ static int mcux_igpio_3_init(struct device *dev);
 
 static const struct mcux_igpio_config mcux_igpio_3_config = {
 	.common = {
-		.port_pin_mask = GPIO_PORT_PIN_MASK_FROM_NGPIOS(DT_INST_2_NXP_IMX_GPIO_NGPIOS),
+		.port_pin_mask = GPIO_PORT_PIN_MASK_FROM_DT_INST(2),
 	},
 	.base = (GPIO_Type *)DT_NXP_IMX_GPIO_GPIO_3_BASE_ADDRESS,
 };
@@ -331,7 +343,7 @@ static int mcux_igpio_4_init(struct device *dev);
 
 static const struct mcux_igpio_config mcux_igpio_4_config = {
 	.common = {
-		.port_pin_mask = GPIO_PORT_PIN_MASK_FROM_NGPIOS(DT_INST_3_NXP_IMX_GPIO_NGPIOS),
+		.port_pin_mask = GPIO_PORT_PIN_MASK_FROM_DT_INST(3),
 	},
 	.base = (GPIO_Type *)DT_NXP_IMX_GPIO_GPIO_4_BASE_ADDRESS,
 };
@@ -369,7 +381,7 @@ static int mcux_igpio_5_init(struct device *dev);
 
 static const struct mcux_igpio_config mcux_igpio_5_config = {
 	.common = {
-		.port_pin_mask = GPIO_PORT_PIN_MASK_FROM_NGPIOS(DT_INST_4_NXP_IMX_GPIO_NGPIOS),
+		.port_pin_mask = GPIO_PORT_PIN_MASK_FROM_DT_INST(4),
 	},
 	.base = (GPIO_Type *)DT_NXP_IMX_GPIO_GPIO_5_BASE_ADDRESS,
 };

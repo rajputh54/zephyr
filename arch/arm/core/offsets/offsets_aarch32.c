@@ -65,14 +65,17 @@ GEN_OFFSET_SYM(_callee_saved_t, v6);
 GEN_OFFSET_SYM(_callee_saved_t, v7);
 GEN_OFFSET_SYM(_callee_saved_t, v8);
 GEN_OFFSET_SYM(_callee_saved_t, psp);
-#if defined(CONFIG_CPU_CORTEX_R)
-GEN_OFFSET_SYM(_callee_saved_t, spsr);
-GEN_OFFSET_SYM(_callee_saved_t, lr);
-#endif
 
 /* size of the entire preempt registers structure */
 
 GEN_ABSOLUTE_SYM(___callee_saved_t_SIZEOF, sizeof(struct _callee_saved));
+
+#if defined(CONFIG_THREAD_STACK_INFO)
+GEN_OFFSET_SYM(_thread_stack_info_t, start);
+
+GEN_ABSOLUTE_SYM(___thread_stack_info_t_SIZEOF,
+	 sizeof(struct _thread_stack_info));
+#endif
 
 /*
  * size of the struct k_thread structure sans save area for floating

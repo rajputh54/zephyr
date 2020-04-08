@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2013-2014 Wind River Systems, Inc.
+ * Copyright (c) 2020 Stephanos Ioannidis <root@stephanos.io>
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -71,17 +72,19 @@ SECTION_SUBSEC_FUNC(TEXT, _HandlerModeExit, z_arm_int_exit)
  */
 
 SECTION_SUBSEC_FUNC(TEXT, _HandlerModeExit, z_arm_exc_exit)
-#if defined(CONFIG_CPU_CORTEX_R)
-    /* r0 contains the caller mode */
-    push {r0, lr}
-#endif
 
 #ifdef CONFIG_PREEMPT_ENABLED
-    ldr r0, =_kernel
+    ldr r3, =_kernel
 
-    ldr r1, [r0, #_kernel_offset_to_current]
+#ifndef CONFIG_CPU_CORTEX_M
+    /* Do not context switch if exiting a nested interrupt */
+    ldr r0, [r3, #_kernel_offset_to_nested]
+    cmp r0, #1
+    bhi _EXIT_EXC
+#endif /* !CONFIG_CPU_CORTEX_M */
 
-    ldr r0, [r0, #_kernel_offset_to_ready_q_cache]
+    ldr r1, [r3, #_kernel_offset_to_current]
+    ldr r0, [r3, #_kernel_offset_to_ready_q_cache]
     cmp r0, r1
     beq _EXIT_EXC
 
@@ -117,33 +120,28 @@ _EXIT_EXC:
 #if defined(CONFIG_CPU_CORTEX_M)
     bx lr
 #elif defined(CONFIG_CPU_CORTEX_R)
-    /* Restore the caller mode to r0 */
-    pop {r0, lr}
+    /* Disable nested interrupts while exiting */
+    cpsid i
+
+    /* Decrement interrupt nesting count */
+    ldr r2, =_kernel
+    ldr r0, [r2, #_kernel_offset_to_nested]
+    sub r0, r0, #1
+    str r0, [r2, #_kernel_offset_to_nested]
+
+    /* Restore previous stack pointer */
+    pop {r2, r3}
+    add sp, sp, r3
 
     /*
-     * Restore r0-r3, r12 and lr stored into the process stack by the mode
+     * Restore r0-r3, r12 and lr_irq stored into the process stack by the mode
      * entry function. These registers are saved by _isr_wrapper for IRQ mode
      * and z_arm_svc for SVC mode.
      *
      * r0-r3 are either the values from the thread before it was switched out
      * or they are the args to _new_thread for a new thread.
      */
-    push {r4, r5}
-
-    cmp r0, #RET_FROM_SVC
     cps #MODE_SYS
-    ldmia sp!, {r0-r5}
-    beq _svc_exit
-
-    cps #MODE_IRQ
-    b _exc_exit
-
-_svc_exit:
-    cps #MODE_SVC
-
-_exc_exit:
-    mov r12, r4
-    mov lr, r5
-    pop {r4, r5}
-    movs pc, lr
+    pop {r0-r3, r12, lr}
+    rfeia sp!
 #endif

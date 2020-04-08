@@ -53,7 +53,7 @@
 
 	soc {
 
-		flash-controller@4001e000 {
+		flash_controller: flash-controller@4001e000 {
 			compatible = "nordic,nrf52-flash-controller";
 			reg = <0x4001e000 0x1000>;
 
@@ -132,6 +132,7 @@
 			reg = <0x50000300 0x200
 			       0x50000800 0x300>;
 			#gpio-cells = <2>;
+			ngpios = <10>;
 			label = "GPIO_1";
 			status = "disabled";
 		};
@@ -212,6 +213,14 @@
 			interrupts = <18 1>;
 			status = "disabled";
 			label = "QDEC";
+		};
+
+		rng: random@4000d000 {
+			compatible = "nordic,nrf-rng";
+			reg = <0x4000d000 0x1000>;
+			interrupts = <13 1>;
+			status = "okay";
+			label = "RNG";
 		};
 
 		spi0: spi@40003000 {
